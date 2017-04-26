@@ -1,0 +1,101 @@
+#!/system/bin/sh
+SCRIPT_PATH=$(dirname "$0")
+PATH=$SCRIPT_PATH:$PATH
+# default commands
+LOGCAT_BIN="su 0 logcat"
+SLEEP_BIN=sleep
+ADDR2LINE_BIN=addr2line
+TAIL_BIN=tail
+# do not use gdb and gdbserver coming with termux,
+#  it is a segfaulting bullshit (compiled with clang???)
+GDBSERVER_BIN="su 0 $SCRIPT_PATH/gdbserver"
+GDB_BIN=arm-linux-androideabi-gdb
+# prevent ^C killing logcat
+BLOCKINT_BIN=blockint
+# shitty logcat switching terminal to CRLF, workaround it by \r
+PRINTF_BIN=printf
+CUT_BIN=cut
+AM_BIN=am
+KILLALL_BIN=killall
+KILLALL_ROOT_BIN="su 0 killall"
+# default options
+VARS=
+MODARGS=
+# for some reason it is -2 when not running from root
+AUSER=$(echo $USER|$CUT_BIN -du -f2|$CUT_BIN -d_ -f1)
+ARGS=
+LOGCAT=
+PID=
+MOD=
+GDB=
+DELAY=1
+GDBARGS=
+CR="$PRINTF_BIN \\r"
+while [ -n "$1" ]; do
+case $1 in
+*=*) VARS=$VARS$(echo $1|$CUT_BIN -d\= -f1),$(echo $1|$CUT_BIN -d= -f2),;shift 1 ;;
+-e) MODARGS="$MODARGS -e $2";shift 2;;
+-m) MODARGS="$MODARGS -e gamelibdir /data/data/in.celest.xash3d.$2/lib";MOD=$2;shift 2;;
+-h) echo Usage: startxash [-m modname] [-g gamedir] [ENV1=VALUE1] [args]; exit 0 ;;
+-g) MODARGS="$MODARGS -e gamedir $2";shift 2;;
+-u) USER=$2;shift 2;;
+-l) LOGCAT=1;$LOGCAT_BIN -G64k;$LOGCAT_BIN -c;shift 1;;
+-gdb) GDB=1;$LOGCAT_BIN -G64k;$LOGCAT_BIN -c;MODARGS="$MODARGS -e gdbsafe 1";shift 1;;
+-d) DELAY=$2;shift 2;;
+-c) GDBARGS="$GDBARGS -ex c";shift 1;;
+-log) LOG=1;ARGS="$ARGS$1 ";shift 1;;
+*) ARGS="$ARGS$1 ";shift 1 ;;
+esac
+done
+# swap arguments and convert to CRLF
+_addr2line()
+{
+addr2line -fCpi -e $7 $6|while read line; do echo "$line";$CR;done
+}
+# run logcat with filter, detect starting and stopping target process
+runlogcat()
+{
+$BLOCKINT_BIN $LOGCAT_BIN  < /dev/null|while read line;do 
+case $line in
+I/ActivityManager*:\ Start\ proc\ *in.celest.xash3d.hl.test*)
+# process launch, fetch logcat pid and start gdbserver
+PID=$(echo $line|$CUT_BIN -d: -f2| $CUT_BIN -d\  -f4)
+$PRINTF_BIN Found\ PID:$PID\\r\\n
+if [ -n "$GDB" ]; then
+$SLEEP_BIN $DELAY
+$GDBSERVER_BIN --attach 127.0.0.1:6666 $(pidof in.celest.xash3d.hl.test) &
+fi
+echo "$line" ;;
+*\(*$PID*\):*) echo "$line";; # show all logs from target and all logs before target start
+?/ActivityManager*\(pid\ $PID\)\ has\ died*) $KILLALL_ROOT_BIN logcat;echo end;; #process died, stop logcat
+?/DEBUG*\):*\#*) # debugger frame, decode it with addr2line
+echo "$line"
+_addr2line $(echo $line|$CUT_BIN -d $($CR) -f1)
+;;
+?/DEBUG*\):*) echo "$line";; # debugger message w/o frame
+?/AndroidRuntime*\):*) echo "$line";; # java exceptions, etc
+*) ;; #ignore everything else
+esac
+done
+}
+#launch activity and put intent extras
+$AM_BIN start --user $AUSER -a in.celest.xash3d.START -n in.celest.xash3d.hl.test/in.celest.xash3d.XashActivity  -e argv "$ARGS" --esa env "$VARS" $MODARGS
+if [ -n "$LOGCAT" ]; then
+# logcat only (needs root)
+BLOCKINT_BIN=
+runlogcat
+elif [ -n "$GDB" ]; then
+# launch gdb
+# logcat in background will show process log between breaks
+runlogcat &
+$SLEEP_BIN $DELAY
+# configure gdb for android process
+$GDB_BIN -ex "set solib-search-path /data/data/in.celest.xash3d.$MOD/lib:/data/data/in.celest.xash3d.hl.test/lib:/system/lib/hw:/system/lib:/vendor/lib" -ex "file /system/bin/app_process" -ex "target remote 127.0.0.1:6666" -ex "handle SIG33 nostop" -ex "thread 1" $GDBARGS
+.# stop log after gdb exit
+$KILLALL_ROOT logcat
+elif [ -n "$LOG" ]; then
+#show simple log (do not need root)
+$TAIL_BIN -c0 -f $LOG| while read line; do case $line in
+*Sys_DestroyConsole:*) $KILLALL_BIN tail;;
+*) echo "$line";;esac;done
+fi
